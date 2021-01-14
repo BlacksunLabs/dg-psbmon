@@ -1,6 +1,6 @@
 package main
 
-// Copyright 2019 Blacksun Research Labs
+// Copyright 2021 Blacksun Research Labs
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -23,6 +23,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	flags "github.com/jessevdk/go-flags"
@@ -31,7 +32,9 @@ import (
 
 // ID is a single paste ID from the Daily API
 type ID struct {
-	ID string `json:"id"`
+	ID   string `json:"id"`
+	Tags string `json:"tags"`
+	Date int    `json:"date"`
 }
 
 // Pastes holds an array of paste IDs
@@ -90,28 +93,64 @@ func open() (db *sql.DB, err error) {
 }
 
 func getDaily() (p *Pastes, err error) {
-	url := "https://psbdmp.cc/api/dump/daily"
+	url := "https://psbdmp.cc/api/v3/getbydate"
+	method := "POST"
 
-	req, err := http.NewRequest("GET", url, nil)
+	year, month, day := time.Now().Date()
+	searchDate := fmt.Sprintf("from=%d.%d.%d&to=%d.%d.%d", day, int(month), year, day, int(month), year)
+
+	payload := strings.NewReader(searchDate)
+
+	client := &http.Client{}
+	req, err := http.NewRequest(method, url, payload)
+
 	if err != nil {
+		fmt.Println(err)
 		return &Pastes{}, err
 	}
 
-	req.Header.Add("Content-Type", "application/json")
+	req.Header.Add("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Add("cache-control", "no-cache")
 
-	res, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return &Pastes{}, err
+	// Sometimes there are Cloudflare Gateway errors.
+	// Check for this condition and retry.
+	// I know this is ugly but it was late and I was too
+	// lazy to learn a retry package.
+	retries := 0
+	var res *http.Response
+	for retries < 3 {
+		res, err = client.Do(req)
+		if err != nil {
+			log.Println("Encountered error sending HTTP request:", err)
+			retries++
+		} else if res.StatusCode == 502 {
+			log.Printf("Encountered 502 error. Retry [%d/3]", retries+1)
+			retries++
+		} else {
+			break
+		}
 	}
 	defer res.Body.Close()
 
-	body, _ := ioutil.ReadAll(res.Body)
+	body, err := ioutil.ReadAll(res.Body)
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
 
-	p = &Pastes{}
-	err = json.Unmarshal(body, &p)
+	// Using a temporary slice of strings to grab the initial response array
+	var tempSlice [][]ID
+
+	err = json.Unmarshal(body, &tempSlice)
 	if err != nil {
 		return &Pastes{}, err
+	}
+
+	// Create a `Pastes` struct and iterate `tempSlice` while appending
+	// to `Pastes`
+	p = &Pastes{}
+	for i := range tempSlice[0] {
+		p.Data = append(p.Data, tempSlice[0][i])
 	}
 
 	return p, nil
@@ -244,7 +283,10 @@ func main() {
 				} else if err != nil && err.Error() == "UNIQUE constraint failed: pastes.paste_ID" {
 					continue
 				}
-				id.send(hostString)
+				err = id.send(hostString)
+				if err != nil {
+					log.Println(err)
+				}
 			}
 		}
 	}
